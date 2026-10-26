@@ -1,0 +1,1071 @@
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h>
+#include <PZEM004Tv40.h>
+
+// =====================================================
+// PIN CONFIGURATION - ARDUINO MEGA 2560
+// =====================================================
+
+// ---------- TFT ST7735 1.8" 128x160 ----------
+#define TFT_CS   53
+#define TFT_DC   49
+#define TFT_RST  48
+
+// ---------- Rental Switch ----------
+#define RENT_SWITCH 22
+
+// ---------- Relay ----------
+#define RELAY_PIN 24
+
+// ---------- Buzzer ----------
+#define BUZZER_PIN 26
+
+// ---------- PZEM-004T V4 ----------
+PZEM004Tv40 pzem(&Serial2);
+
+// =====================================================
+// RELAY CONFIGURATION
+// =====================================================
+//
+// Your relay module is ACTIVE LOW:
+//
+// LOW  = Relay ON
+// HIGH = Relay OFF
+//
+// =====================================================
+
+#define RELAY_ON  LOW
+#define RELAY_OFF HIGH
+
+// =====================================================
+// SETTINGS
+// =====================================================
+
+#define TARIFF 12.0f
+
+// Summary time
+#define SUMMARY_TIME 15
+
+// Payment time
+#define PAYMENT_TIME 15
+
+// Waiting/lock time
+#define WAIT_TIME 15
+
+// =====================================================
+// TFT
+// =====================================================
+
+Adafruit_ST7735 tft = Adafruit_ST7735(
+  TFT_CS,
+  TFT_DC,
+  TFT_RST
+);
+
+#define SCREEN_W 128
+#define SCREEN_H 160
+
+// =====================================================
+// COLORS
+// =====================================================
+
+#define BLACK   ST77XX_BLACK
+#define WHITE   ST77XX_WHITE
+#define RED     ST77XX_RED
+#define GREEN   ST77XX_GREEN
+#define BLUE    ST77XX_BLUE
+#define CYAN    ST77XX_CYAN
+#define YELLOW  ST77XX_YELLOW
+#define MAGENTA ST77XX_MAGENTA
+
+// =====================================================
+// STATE MACHINE
+// =====================================================
+
+enum SystemState {
+  WELCOME,
+  READY,
+  RENTING,
+  SUMMARY,
+  PAYMENT,
+  WAIT_STATE,
+  ERROR_STATE
+};
+
+SystemState state = WELCOME;
+
+// =====================================================
+// VARIABLES
+// =====================================================
+
+float voltage = 0;
+float current = 0;
+float power = 0;
+float energy = 0;
+float frequency = 0;
+float pf = 0;
+
+float startEnergy = 0;
+float sessionEnergy = 0;
+float sessionCost = 0;
+
+unsigned long stateStartTime = 0;
+unsigned long lastReadTime = 0;
+unsigned long lastBeepTime = 0;
+
+bool welcomeFinished = false;
+
+// =====================================================
+// RELAY FUNCTIONS
+// =====================================================
+
+// Turn relay ON
+void relayON() {
+  digitalWrite(RELAY_PIN, LOW);
+}
+
+// Turn relay OFF
+void relayOFF() {
+  digitalWrite(RELAY_PIN, HIGH);
+}
+
+// =====================================================
+// BUZZER
+// =====================================================
+
+void beep() {
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(100);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+void doubleBeep() {
+  beep();
+  delay(100);
+  beep();
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup() {
+
+  // Serial monitor
+  Serial.begin(115200);
+
+  // PZEM
+  Serial2.begin(9600);
+
+  // Switch
+  pinMode(RENT_SWITCH, INPUT_PULLUP);
+
+  // Relay
+  pinMode(RELAY_PIN, OUTPUT);
+
+  // IMPORTANT:
+  // Relay OFF at startup
+  digitalWrite(RELAY_PIN, HIGH);
+
+  // Buzzer
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  // TFT
+  tft.initR(INITR_BLACKTAB);
+
+  // Portrait mode = 128 x 160
+  tft.setRotation(0);
+
+  tft.fillScreen(BLACK);
+
+  // PZEM
+  pzem.begin();
+
+  // Show welcome
+  showWelcome();
+
+  stateStartTime = millis();
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop() {
+
+  switch (state) {
+
+    case WELCOME:
+      handleWelcome();
+      break;
+
+    case READY:
+      handleReady();
+      break;
+
+    case RENTING:
+      handleRenting();
+      break;
+
+    case SUMMARY:
+      handleSummary();
+      break;
+
+    case PAYMENT:
+      handlePayment();
+      break;
+
+    case WAIT_STATE:
+      handleWait();
+      break;
+
+    case ERROR_STATE:
+      handleError();
+      break;
+  }
+}
+
+// =====================================================
+// WELCOME SCREEN
+// =====================================================
+
+void showWelcome() {
+
+  tft.fillScreen(BLACK);
+
+  tft.setTextColor(CYAN);
+  tft.setTextSize(2);
+
+  tft.setCursor(20, 20);
+  tft.print("SMART");
+
+  tft.setCursor(15, 45);
+  tft.print("RENTAL");
+
+  tft.setTextColor(WHITE);
+  tft.setTextSize(1);
+
+  tft.setCursor(20, 75);
+  tft.print("POWER CONTROLLER");
+
+  tft.setCursor(30, 100);
+  tft.print("INITIALIZING");
+
+  tft.setCursor(45, 120);
+  tft.print("...");
+}
+
+// =====================================================
+// WELCOME HANDLER
+// =====================================================
+
+void handleWelcome() {
+
+  unsigned long elapsed = millis() - stateStartTime;
+
+  if (elapsed >= 5000) {
+
+    state = READY;
+
+    relayOFF();
+
+    showReady();
+
+    stateStartTime = millis();
+  }
+}
+
+// =====================================================
+// READ PZEM
+// =====================================================
+
+bool readPZEM() {
+
+  float v = pzem.voltage();
+  float c = pzem.current();
+  float p = pzem.power();
+  float e = pzem.energy();
+  float f = pzem.frequency();
+  float factor = pzem.pf();
+
+  if (isnan(v) || isnan(c) || isnan(p)) {
+    return false;
+  }
+
+  voltage = v;
+  current = c;
+  power = p;
+  energy = e;
+  frequency = f;
+  pf = factor;
+
+  return true;
+}
+
+// =====================================================
+// READY SCREEN
+// =====================================================
+
+void showReady() {
+
+  tft.fillScreen(BLACK);
+
+  tft.setTextColor(CYAN);
+  tft.setTextSize(2);
+
+  tft.setCursor(28, 5);
+  tft.print("READY");
+
+  tft.drawLine(0, 28, 127, 28, WHITE);
+
+  tft.setTextSize(1);
+  tft.setTextColor(WHITE);
+
+  tft.setCursor(5, 38);
+  tft.print("Voltage : ");
+  tft.print(voltage, 1);
+  tft.print(" V");
+
+  tft.setCursor(5, 53);
+  tft.print("Current : ");
+  tft.print(current, 2);
+  tft.print(" A");
+
+  tft.setCursor(5, 68);
+  tft.print("Power   : ");
+  tft.print(power, 1);
+  tft.print(" W");
+
+  tft.setCursor(5, 83);
+  tft.print("Freq    : ");
+  tft.print(frequency, 1);
+  tft.print(" Hz");
+
+  tft.setCursor(5, 98);
+  tft.print("PF      : ");
+  tft.print(pf, 2);
+
+  tft.drawLine(0, 113, 127, 113, WHITE);
+
+  tft.setTextColor(YELLOW);
+
+  tft.setCursor(5, 122);
+  tft.print("TURN SWITCH ON");
+
+  tft.setCursor(5, 137);
+  tft.print("TO START RENTAL");
+}
+
+// =====================================================
+// READY HANDLER
+// =====================================================
+
+void handleReady() {
+
+  // Relay must remain OFF
+  relayOFF();
+
+  if (millis() - lastReadTime >= 1000) {
+
+    lastReadTime = millis();
+
+    if (!readPZEM()) {
+      showErrorMessage("PZEM ERROR");
+      return;
+    }
+
+    showReady();
+  }
+
+  // Switch ON
+  if (digitalRead(RENT_SWITCH) == LOW) {
+
+    delay(80);
+
+    if (digitalRead(RENT_SWITCH) == LOW) {
+
+      startEnergy = energy;
+
+      sessionEnergy = 0;
+      sessionCost = 0;
+
+      // =================================================
+      // TURN RELAY ON
+      // =================================================
+
+      digitalWrite(RELAY_PIN, LOW);
+
+      beep();
+
+      state = RENTING;
+      stateStartTime = millis();
+
+      showRenting();
+
+      delay(300);
+    }
+  }
+}
+
+// =====================================================
+// RENTING SCREEN
+// =====================================================
+
+void showRenting() {
+
+  tft.fillScreen(BLACK);
+
+  tft.setTextColor(GREEN);
+  tft.setTextSize(2);
+
+  tft.setCursor(17, 5);
+  tft.print("RENTING");
+
+  tft.drawLine(0, 28, 127, 28, WHITE);
+
+  tft.setTextSize(1);
+  tft.setTextColor(WHITE);
+
+  tft.setCursor(5, 37);
+  tft.print("Voltage : ");
+  tft.print(voltage, 1);
+  tft.print(" V");
+
+  tft.setCursor(5, 52);
+  tft.print("Current : ");
+  tft.print(current, 2);
+  tft.print(" A");
+
+  tft.setCursor(5, 67);
+  tft.print("Power   : ");
+  tft.print(power, 1);
+  tft.print(" W");
+
+  tft.setCursor(5, 82);
+  tft.print("Energy  : ");
+  tft.print(sessionEnergy, 3);
+  tft.print(" kWh");
+
+  tft.setCursor(5, 97);
+  tft.print("Cost    : Rs ");
+  tft.print(sessionCost, 2);
+
+  tft.setCursor(5, 112);
+  tft.print("F:");
+  tft.print(frequency, 1);
+
+  tft.print("Hz  PF:");
+  tft.print(pf, 2);
+
+  tft.setTextColor(YELLOW);
+
+  tft.setCursor(5, 137);
+  tft.print("SWITCH OFF TO STOP");
+}
+
+// =====================================================
+// RENTING HANDLER
+// =====================================================
+
+void handleRenting() {
+
+  // Relay stays ON while renting
+  digitalWrite(RELAY_PIN, LOW);
+
+  // Read PZEM every second
+  if (millis() - lastReadTime >= 1000) {
+
+    lastReadTime = millis();
+
+    if (!readPZEM()) {
+
+      // Safety: turn relay OFF
+      relayOFF();
+
+      showErrorMessage("PZEM ERROR");
+
+      state = ERROR_STATE;
+      stateStartTime = millis();
+
+      return;
+    }
+
+    // Calculate session energy
+    if (energy >= startEnergy) {
+      sessionEnergy = energy - startEnergy;
+    }
+    else {
+      sessionEnergy = 0;
+    }
+
+    // Cost
+    sessionCost = sessionEnergy * TARIFF;
+
+    showRenting();
+  }
+
+  // Switch OFF
+  if (digitalRead(RENT_SWITCH) == HIGH) {
+
+    delay(80);
+
+    if (digitalRead(RENT_SWITCH) == HIGH) {
+
+      // =================================================
+      // TURN RELAY OFF
+      // =================================================
+
+      digitalWrite(RELAY_PIN, HIGH);
+
+      // Final calculation
+      if (energy >= startEnergy) {
+        sessionEnergy = energy - startEnergy;
+      }
+      else {
+        sessionEnergy = 0;
+      }
+
+      sessionCost = sessionEnergy * TARIFF;
+
+      beep();
+
+      state = SUMMARY;
+      stateStartTime = millis();
+
+      showSummary();
+    }
+  }
+}
+
+// =====================================================
+// SUMMARY SCREEN
+// =====================================================
+
+void showSummary() {
+
+  // Relay MUST be OFF
+  digitalWrite(RELAY_PIN, HIGH);
+
+  tft.fillScreen(BLACK);
+
+  tft.setTextColor(YELLOW);
+  tft.setTextSize(2);
+
+  tft.setCursor(17, 5);
+  tft.print("SUMMARY");
+
+  tft.drawLine(0, 28, 127, 28, WHITE);
+
+  tft.setTextSize(1);
+  tft.setTextColor(WHITE);
+
+  tft.setCursor(5, 40);
+  tft.print("Energy Used");
+
+  tft.setCursor(5, 54);
+  tft.print(sessionEnergy, 3);
+  tft.print(" kWh");
+
+  tft.setCursor(5, 72);
+  tft.print("Rate : Rs ");
+  tft.print(TARIFF, 2);
+  tft.print("/unit");
+
+  tft.setTextColor(GREEN);
+  tft.setTextSize(2);
+
+  tft.setCursor(5, 90);
+  tft.print("Rs ");
+  tft.print(sessionCost, 2);
+
+  tft.drawLine(0, 107, 127, 107, WHITE);
+
+  tft.setTextColor(CYAN);
+  tft.setTextSize(1);
+
+  tft.setCursor(22, 115);
+  tft.print("PAYMENT IN");
+
+  drawSummaryCountdown();
+}
+
+// =====================================================
+// SUMMARY COUNTDOWN
+// =====================================================
+
+void drawSummaryCountdown() {
+
+  unsigned long elapsed = millis() - stateStartTime;
+
+  int remaining = SUMMARY_TIME - (elapsed / 1000);
+
+  if (remaining < 0) {
+    remaining = 0;
+  }
+
+  tft.fillRect(0, 130, 127, 159, BLACK);
+
+  tft.setTextColor(WHITE);
+  tft.setTextSize(2);
+
+  tft.setCursor(45, 130);
+
+  if (remaining < 10) {
+    tft.print("0");
+  }
+
+  tft.print(remaining);
+  tft.print("s");
+}
+
+// =====================================================
+// SUMMARY HANDLER
+// =====================================================
+
+void handleSummary() {
+
+  // Relay must remain OFF
+  digitalWrite(RELAY_PIN, HIGH);
+
+  unsigned long elapsed = millis() - stateStartTime;
+
+  drawSummaryCountdown();
+
+  // If switch is turned ON during summary
+  if (digitalRead(RENT_SWITCH) == LOW) {
+
+    beep();
+
+    state = WAIT_STATE;
+    stateStartTime = millis();
+
+    showWait();
+
+    return;
+  }
+
+  // Summary finished
+  if (elapsed >= (SUMMARY_TIME * 1000UL)) {
+
+    state = PAYMENT;
+    stateStartTime = millis();
+
+    showPayment();
+  }
+}
+
+// =====================================================
+// DUMMY QR CODE
+// =====================================================
+
+void drawDummyQR() {
+
+  const int moduleSize = 3;
+
+  const int qrSize = 21;
+
+  const int qrPixelSize = qrSize * moduleSize;
+
+  const int startX = (SCREEN_W - qrPixelSize) / 2;
+  const int startY = 42;
+
+  // White background
+  tft.fillRect(
+    startX - 2,
+    startY - 2,
+    qrPixelSize + 4,
+    qrPixelSize + 4,
+    WHITE
+  );
+
+  // Draw pseudo QR pattern
+  for (int y = 0; y < qrSize; y++) {
+
+    for (int x = 0; x < qrSize; x++) {
+
+      bool black = false;
+
+      // Finder patterns
+      bool finder = false;
+
+      // Top-left
+      if (x < 7 && y < 7) {
+        finder = true;
+
+        if (
+          x == 0 || x == 6 ||
+          y == 0 || y == 6 ||
+          (x >= 2 && x <= 4 &&
+           y >= 2 && y <= 4)
+        ) {
+          black = true;
+        }
+      }
+
+      // Top-right
+      else if (x >= 14 && y < 7) {
+        finder = true;
+
+        int xx = x - 14;
+
+        if (
+          xx == 0 || xx == 6 ||
+          y == 0 || y == 6 ||
+          (xx >= 2 && xx <= 4 &&
+           y >= 2 && y <= 4)
+        ) {
+          black = true;
+        }
+      }
+
+      // Bottom-left
+      else if (x < 7 && y >= 14) {
+        finder = true;
+
+        int yy = y - 14;
+
+        if (
+          x == 0 || x == 6 ||
+          yy == 0 || yy == 6 ||
+          (x >= 2 && x <= 4 &&
+           yy >= 2 && yy <= 4)
+        ) {
+          black = true;
+        }
+      }
+
+      if (!finder) {
+
+        // Pseudo random pattern
+        if (((x * 3 + y * 5 + x * y) % 7) < 3) {
+          black = true;
+        }
+      }
+
+      if (black) {
+
+        tft.fillRect(
+          startX + x * moduleSize,
+          startY + y * moduleSize,
+          moduleSize,
+          moduleSize,
+          BLACK
+        );
+      }
+    }
+  }
+}
+
+// =====================================================
+// PAYMENT SCREEN
+// =====================================================
+
+void showPayment() {
+
+  // Relay MUST be OFF
+  digitalWrite(RELAY_PIN, HIGH);
+
+  tft.fillScreen(BLACK);
+
+  tft.setTextColor(CYAN);
+  tft.setTextSize(2);
+
+  tft.setCursor(20, 3);
+  tft.print("PAYMENT");
+
+  tft.setTextSize(1);
+  tft.setTextColor(YELLOW);
+
+  tft.setCursor(38, 25);
+  tft.print("Rs ");
+  tft.print(sessionCost, 2);
+
+  // Dummy QR
+  drawDummyQR();
+
+  tft.setTextColor(WHITE);
+
+  tft.setCursor(34, 110);
+  tft.print("SCAN TO PAY");
+
+  tft.setTextColor(RED);
+
+  tft.setCursor(28, 123);
+  tft.print("QR UNDER WORK");
+
+  drawPaymentCountdown();
+}
+
+// =====================================================
+// PAYMENT COUNTDOWN
+// =====================================================
+
+void drawPaymentCountdown() {
+
+  unsigned long elapsed = millis() - stateStartTime;
+
+  int remaining = PAYMENT_TIME - (elapsed / 1000);
+
+  if (remaining < 0) {
+    remaining = 0;
+  }
+
+  tft.fillRect(0, 141, 127, 159, BLACK);
+
+  tft.setTextColor(WHITE);
+  tft.setTextSize(2);
+
+  tft.setCursor(45, 141);
+
+  if (remaining < 10) {
+    tft.print("0");
+  }
+
+  tft.print(remaining);
+  tft.print("s");
+}
+
+// =====================================================
+// PAYMENT HANDLER
+// =====================================================
+
+void handlePayment() {
+
+  // Relay MUST remain OFF
+  digitalWrite(RELAY_PIN, HIGH);
+
+  unsigned long elapsed = millis() - stateStartTime;
+
+  drawPaymentCountdown();
+
+  // If switch is turned ON during payment
+  if (digitalRead(RENT_SWITCH) == LOW) {
+
+    if (millis() - lastBeepTime >= 2000) {
+
+      lastBeepTime = millis();
+
+      beep();
+    }
+
+    tft.fillRect(0, 15, 127, 22, BLACK);
+
+    tft.setTextColor(RED);
+    tft.setTextSize(1);
+
+    tft.setCursor(15, 15);
+    tft.print("PLEASE WAIT...");
+  }
+
+  // Payment period finished
+  if (elapsed >= (PAYMENT_TIME * 1000UL)) {
+
+    // If switch is OFF, go READY
+    if (digitalRead(RENT_SWITCH) == HIGH) {
+
+      state = READY;
+      stateStartTime = millis();
+
+      showReady();
+
+      return;
+    }
+
+    // If switch is still ON,
+    // enter waiting state
+    state = WAIT_STATE;
+    stateStartTime = millis();
+
+    showWait();
+  }
+}
+
+// =====================================================
+// WAIT SCREEN
+// =====================================================
+
+void showWait() {
+
+  // Relay MUST be OFF
+  digitalWrite(RELAY_PIN, HIGH);
+
+  tft.fillScreen(BLACK);
+
+  tft.setTextColor(RED);
+  tft.setTextSize(2);
+
+  tft.setCursor(40, 15);
+  tft.print("WAIT");
+
+  tft.setTextSize(1);
+  tft.setTextColor(WHITE);
+
+  tft.setCursor(12, 50);
+  tft.print("Previous rental");
+
+  tft.setCursor(12, 65);
+  tft.print("is still closing.");
+
+  tft.setTextColor(YELLOW);
+
+  tft.setCursor(12, 82);
+  tft.print("Please wait...");
+
+  tft.setTextColor(CYAN);
+
+  tft.setCursor(12, 110);
+  tft.print("RENTAL LOCK ACTIVE");
+
+  tft.setTextColor(WHITE);
+
+  tft.setCursor(25, 128);
+  tft.print("Switch OFF");
+}
+
+// =====================================================
+// WAIT HANDLER
+// =====================================================
+
+void handleWait() {
+
+  // Relay MUST remain OFF
+  digitalWrite(RELAY_PIN, HIGH);
+
+  unsigned long elapsed = millis() - stateStartTime;
+
+  int remaining = WAIT_TIME - (elapsed / 1000);
+
+  if (remaining < 0) {
+    remaining = 0;
+  }
+
+  tft.fillRect(35, 135, 60, 20, BLACK);
+
+  tft.setTextColor(WHITE);
+  tft.setTextSize(2);
+
+  tft.setCursor(45, 135);
+
+  if (remaining < 10) {
+    tft.print("0");
+  }
+
+  tft.print(remaining);
+
+  // Beep every 2 seconds if switch is still ON
+  if (
+    digitalRead(RENT_SWITCH) == LOW &&
+    millis() - lastBeepTime >= 2000
+  ) {
+
+    lastBeepTime = millis();
+
+    beep();
+  }
+
+  // Wait period finished
+  if (elapsed >= (WAIT_TIME * 1000UL)) {
+
+    // Only return to READY if switch is OFF
+    if (digitalRead(RENT_SWITCH) == HIGH) {
+
+      state = READY;
+      stateStartTime = millis();
+
+      showReady();
+    }
+    else {
+
+      // Switch still ON
+      stateStartTime = millis();
+
+      showWait();
+    }
+  }
+}
+
+// =====================================================
+// ERROR MESSAGE
+// =====================================================
+
+void showErrorMessage(const char *message) {
+
+  // Safety: relay OFF
+  digitalWrite(RELAY_PIN, HIGH);
+
+  tft.fillScreen(BLACK);
+
+  tft.setTextColor(RED);
+  tft.setTextSize(2);
+
+  tft.setCursor(28, 15);
+  tft.print("ERROR");
+
+  tft.setTextSize(1);
+  tft.setTextColor(WHITE);
+
+  tft.setCursor(10, 55);
+  tft.print(message);
+
+  tft.setCursor(10, 75);
+  tft.print("Check connection.");
+
+  beep();
+}
+
+// =====================================================
+// ERROR SCREEN
+// =====================================================
+
+void showError() {
+
+  digitalWrite(RELAY_PIN, HIGH);
+
+  tft.fillScreen(BLACK);
+
+  tft.setTextColor(RED);
+  tft.setTextSize(2);
+
+  tft.setCursor(28, 15);
+  tft.print("ERROR");
+
+  tft.setTextSize(1);
+  tft.setTextColor(WHITE);
+
+  tft.setCursor(10, 55);
+  tft.print("System Error");
+
+  tft.setCursor(10, 75);
+  tft.print("Relay OFF");
+
+  tft.setCursor(10, 95);
+  tft.print("Check system.");
+
+  beep();
+}
+
+// =====================================================
+// ERROR HANDLER
+// =====================================================
+
+void handleError() {
+
+  // Safety first
+  digitalWrite(RELAY_PIN, HIGH);
+
+  unsigned long elapsed = millis() - stateStartTime;
+
+  if (elapsed >= 5000) {
+
+    if (digitalRead(RENT_SWITCH) == HIGH) {
+
+      state = READY;
+
+      showReady();
+
+      stateStartTime = millis();
+    }
+  }
+}
